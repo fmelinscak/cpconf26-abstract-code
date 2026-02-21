@@ -1,0 +1,811 @@
+---
+title: "Similarity-aware vs Random Extinction Selection (MDS + fear ratings)"
+format:
+  html:
+    toc: true
+execute:
+  warning: false
+  message: false
+params:
+  data_path: "data/coors_rates_5dims.csv"
+  id_col: "...1"
+  x_cols: ["D1", "D2", "D3","D4", "D5"]
+  fear_col: "fear_mean"
+  T: 100              # number of extinction trials (stimuli selected)
+  eta: 0.2          # learning rate (0..1)
+  sigma_scale: 0.5   # sigma = sigma_scale * median(pairwise distance)
+  kernel: "gaussian"        # "gaussian" or "exponential"
+  estimate_sigma: true      # estimate sigma from baseline fear smoothness (LOO kernel regression)
+  sigma_grid_scales: [0.05, 0.1, 0.2, 0.3, 0.5, 0.8, 1.0, 1.5, 2.0]  # candidates: × median pairwise distance
+  n_random: 500      # number of random schedules to average over
+  seed: 1
+  run_hierarchy: true      # include fear-only fixed-order baselines
+  run_constrained: true   # include similarity-aware constrained by ascending fear cap
+  run_within_bin: true   # compare random-within-bin vs similarity-aware-within-bin
+  n_bins: 6                # number of baseline-fear bins (quantile bins)
+  bin_schedule: "linear"   # unlock bins linearly across T
+  hierarchy_orders: ["ascending", "descending"]  # fixed order by baseline fear
+---
+
+```{r}
+
+library(tidyverse)
+library(here)
+
+set.seed(params$seed)
+
+# ---- Load data ----
+dat <- read_csv(here(params$data_path), show_col_types = FALSE) %>%
+  rename(id = all_of(params$id_col)) %>%
+  mutate(
+    id = as.character(id),
+    fear0 = .data[[params$fear_col]]
+  )
+
+
+stopifnot(all(params$x_cols %in% names(dat)))
+stopifnot("fear0" %in% names(dat))
+
+X <- as.matrix(dat[, params$x_cols])
+fear0 <- dat$fear0
+
+# ---- Baseline fear bins for tolerability-constrained selection ----
+make_fear_bins <- function(fear0, n_bins) {
+  probs <- seq(0, 1, length.out = n_bins + 1)
+  cuts <- unique(quantile(fear0, probs = probs, na.rm = TRUE))
+  if (length(cuts) < 3) stop("Not enough unique fear values to form bins.")
+  bin_id <- as.integer(cut(fear0, breaks = cuts, include.lowest = TRUE, labels = FALSE))
+  list(bin_id = bin_id, cuts = cuts, n_bins_actual = max(bin_id, na.rm = TRUE))
+}
+
+unlocked_bin_at_t <- function(tt, T, n_bins, schedule = c("linear")) {
+  schedule <- match.arg(schedule)
+  pmax(1L, pmin(n_bins, as.integer(ceiling(tt * n_bins / T))))
+}
+
+bins <- make_fear_bins(fear0, params$n_bins)
+bin_id <- bins$bin_id
+n_bins_actual <- bins$n_bins_actual
+
+N <- nrow(dat)
+
+# ---- Distance matrix + generalization kernel ----
+D <- as.matrix(dist(X))
+medD <- median(D[upper.tri(D)])
+
+kernel_weights <- function(D, sigma, kernel = c("gaussian", "exponential")) {
+  kernel <- match.arg(kernel)
+  if (kernel == "gaussian") {
+    exp(-(D^2) / (2 * sigma^2))
+  } else {
+    exp(-D / sigma)
+  }
+}
+
+loo_kernel_r2 <- function(y, D, sigma, kernel) {
+  y <- as.numeric(y)
+  ybar <- mean(y)
+  sst <- sum((y - ybar)^2)
+
+  W <- kernel_weights(D, sigma, kernel)
+  diag(W) <- 0  # leave-one-out
+  denom <- rowSums(W)
+  yhat <- ifelse(denom > 0, (W %*% y) / denom, ybar)
+
+  sse <- sum((y - yhat)^2)
+  as.numeric(1 - sse / sst)
+}
+
+if (isTRUE(params$estimate_sigma)) {
+  sigma_grid <- medD * unlist(params$sigma_grid_scales)
+
+  sigma_fit <- tibble(
+    sigma = sigma_grid,
+    scale = sigma_grid / medD,
+    r2_loo = purrr::map_dbl(sigma_grid, ~ loo_kernel_r2(fear0, D, .x, params$kernel))
+  ) %>%
+    arrange(desc(r2_loo))
+
+  sigma <- sigma_fit$sigma[1]
+  sigma_scale_used <- sigma_fit$scale[1]
+  sigma_r2 <- sigma_fit$r2_loo[1]
+} else {
+  sigma <- params$sigma_scale * medD
+  sigma_scale_used <- params$sigma_scale
+  sigma_r2 <- NA_real_
+  sigma_fit <- tibble(sigma = sigma, scale = sigma_scale_used, r2_loo = sigma_r2)
+}
+
+K <- kernel_weights(D, sigma, params$kernel)  # K[i,j] in (0,1]; K[i,i] = 1
+
+# Fixed fear-only orders based on baseline fear
+order_asc <- order(fear0, decreasing = FALSE)
+order_desc <- order(fear0, decreasing = TRUE)
+```
+
+```{r}
+# ---- Optional: bandwidth selection diagnostics ----
+if (isTRUE(params$estimate_sigma)) {
+  ggplot(sigma_fit, aes(x = scale, y = r2_loo)) +
+    geom_line() +
+    geom_point() +
+    labs(
+      x = "sigma (× median pairwise distance)",
+      y = "LOO R² predicting baseline fear",
+      title = "Bandwidth selection for fear smoothness"
+    ) +
+    theme_minimal()
+}
+```
+
+
+```{r}
+# ---- One-step update: multiplicative reduction generalized by kernel row ----
+update_fear <- function(fear, s_idx, eta, K) {
+  fear_new <- fear * (1 - eta * K[s_idx, ])
+  pmax(fear_new, 0)
+}
+
+# ---- Policy: similarity-aware greedy (maximize predicted global fear reduction) ----
+# Gain(i) = sum_j fear_j * K[i,j]
+choose_similarity_aware <- function(fear, available, K) {
+  gains <- rowSums(K[available, , drop = FALSE] * matrix(fear, nrow = length(available), ncol = length(fear), byrow = TRUE))
+  available[which.max(gains)]
+}
+
+# ---- Policy: similarity-aware with tolerability constraint (ascending fear cap) ----
+# At trial tt, only allow stimuli with baseline fear <= cap implied by ascending hierarchy:
+# cap(tt) = baseline fear of the tt-th item in ascending order.
+choose_similarity_constrained <- function(fear, available, K, fear0, order_asc, tt) {
+  idx_cap <- order_asc[pmin(tt, length(order_asc))]
+  cap <- fear0[idx_cap]
+  eligible <- intersect(available, which(fear0 <= cap))
+
+  # Fallback: ensure at least the cap item is eligible
+  if (length(eligible) == 0) eligible <- intersect(available, idx_cap)
+
+  choose_similarity_aware(fear, eligible, K)
+}
+
+
+# ---- Policies: within-bin selection (tolerability constraint) ----
+choose_random_within_bin <- function(available, bin_id, max_bin) {
+  eligible <- available[bin_id[available] <= max_bin]
+  if (length(eligible) == 0) eligible <- available
+  sample(eligible, 1)
+}
+
+choose_similarity_within_bin <- function(fear, available, K, bin_id, max_bin) {
+  eligible <- available[bin_id[available] <= max_bin]
+  if (length(eligible) == 0) eligible <- available
+  choose_similarity_aware(fear, eligible, K)
+}
+
+
+# ---- Simulate one schedule ----
+# Policies:
+# - "similarity": greedy selection using MDS similarity and current fear
+# - "random": random order
+# - "ascending": fixed order by baseline fear (low -> high)
+# - "descending": fixed order by baseline fear (high -> low)
+simulate_schedule <- function(policy = c("similarity", "similarity_constrained",
+                                        "random", "ascending", "descending",
+                                        "random_within_bin", "similarity_within_bin"),
+                              fear0, K, T, eta, order_asc, order_desc,
+                              bin_id = NULL, n_bins = NULL, bin_schedule = "linear",
+                              seed = NULL) {
+  policy <- match.arg(policy)
+  if (!is.null(seed)) set.seed(seed)
+
+  fear <- fear0
+  available <- seq_along(fear0)
+  chosen <- integer(0)
+
+  out <- tibble(t = 0:T, mean_fear = NA_real_)
+  out$mean_fear[1] <- mean(fear)
+
+  for (tt in 1:T) {
+    if (length(available) == 0) available <- seq_along(fear0)
+
+    s <- if (policy == "random") {
+      sample(available, 1)
+    } else if (policy == "similarity") {
+      choose_similarity_aware(fear, available, K)
+    } else if (policy == "random_within_bin") {
+      max_bin <- unlocked_bin_at_t(tt, T, n_bins, bin_schedule)
+      choose_random_within_bin(available, bin_id, max_bin)
+    } else if (policy == "similarity_within_bin") {
+      max_bin <- unlocked_bin_at_t(tt, T, n_bins, bin_schedule)
+      choose_similarity_within_bin(fear, available, K, bin_id, max_bin)
+    } else if (policy == "similarity_constrained") {
+      choose_similarity_constrained(fear, available, K, fear0, order_asc, tt)
+    } else if (policy == "ascending") {
+      order_asc[order_asc %in% available][1]
+    } else { # descending
+      order_desc[order_desc %in% available][1]
+    }
+
+    fear <- update_fear(fear, s, eta, K)
+    chosen <- c(chosen, s)
+    available <- setdiff(available, s)
+    out$mean_fear[tt + 1] <- mean(fear)
+  }
+
+  list(curve = out, chosen = chosen)
+}
+
+# ---- Run similarity-aware (deterministic) ----
+sim_sim <- simulate_schedule(
+  "similarity", fear0, K, params$T, params$eta,
+  order_asc = order_asc, order_desc = order_desc,
+  seed = params$seed
+)
+curve_sim <- sim_sim$curve %>% mutate(policy = "Similarity-aware", run = 1)
+
+# ---- Run similarity-aware (constrained by ascending fear cap) ----
+sim_sim_con <- NULL
+curve_sim_con <- NULL
+if (isTRUE(params$run_constrained)) {
+  sim_sim_con <- simulate_schedule(
+    "similarity_constrained", fear0, K, params$T, params$eta,
+    order_asc = order_asc, order_desc = order_desc,
+    seed = params$seed
+  )
+  curve_sim_con <- sim_sim_con$curve %>% mutate(policy = "Similarity-aware (constrained)", run = 1)
+}
+
+# ---- Run within-bin policies (fair comparison under tolerability constraint) ----
+sim_sim_bin <- NULL
+curve_sim_bin <- NULL
+curves_rand_bin <- NULL
+
+if (isTRUE(params$run_within_bin)) {
+  sim_sim_bin <- simulate_schedule(
+    "similarity_within_bin", fear0, K, params$T, params$eta,
+    order_asc = order_asc, order_desc = order_desc,
+    bin_id = bin_id, n_bins = n_bins_actual, bin_schedule = params$bin_schedule,
+    seed = params$seed
+  )
+  curve_sim_bin <- sim_sim_bin$curve %>% mutate(policy = "Similarity-aware (within-bin)", run = 1)
+
+  curves_rand_bin <- map_dfr(seq_len(params$n_random), function(r) {
+    sim <- simulate_schedule(
+      "random_within_bin", fear0, K, params$T, params$eta,
+      order_asc = order_asc, order_desc = order_desc,
+      bin_id = bin_id, n_bins = n_bins_actual, bin_schedule = params$bin_schedule,
+      seed = params$seed + r
+    )
+    sim$curve %>% mutate(policy = "Random (within-bin)", run = r)
+  })
+}
+
+
+
+# ---- Run random many times ----
+curves_rand <- map_dfr(seq_len(params$n_random), function(r) {
+  sim <- simulate_schedule(
+    "random", fear0, K, params$T, params$eta,
+    order_asc = order_asc, order_desc = order_desc,
+    seed = params$seed + r
+  )
+  sim$curve %>% mutate(policy = "Random", run = r)
+})
+
+# Summarize random curves (band across runs)
+curve_rand_sum <- curves_rand %>%
+  group_by(t) %>%
+  summarise(
+    avg_mean_fear = mean(mean_fear, na.rm = TRUE),
+    lo = quantile(mean_fear, 0.25, na.rm = TRUE),
+    hi = quantile(mean_fear, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(policy = "Random")
+
+# Summarize random-within-bin curves (band across runs)
+curve_rand_bin_sum <- NULL
+if (!is.null(curves_rand_bin)) {
+  curve_rand_bin_sum <- curves_rand_bin %>%
+    group_by(t) %>%
+    summarise(
+      avg_mean_fear = mean(mean_fear, na.rm = TRUE),
+      lo = quantile(mean_fear, 0.25, na.rm = TRUE),
+      hi = quantile(mean_fear, 0.75, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(policy = "Random (within-bin)")
+}
+
+
+# ---- Optional: fear-only fixed-order baselines ----
+curve_hier <- NULL
+hier_sims <- list()
+if (isTRUE(params$run_hierarchy)) {
+  orders <- params$hierarchy_orders
+  hier_sims <- rlang::set_names(vector("list", length(orders)), orders)
+
+  curve_hier <- purrr::map_dfr(orders, function(o) {
+    sim <- simulate_schedule(
+      o, fear0, K, params$T, params$eta,
+      order_asc = order_asc, order_desc = order_desc,
+      seed = params$seed
+    )
+    hier_sims[[o]] <<- sim
+    sim$curve %>% mutate(policy = paste0("Fear-only (", o, ")"), run = 1)
+  })
+}
+
+# ---- Plot learning curves ----
+line_df <- bind_rows(
+  curve_sim,
+  curve_sim_con,
+  curve_sim_bin,
+  curve_hier
+)
+
+p <- ggplot() +
+  geom_ribbon(
+    data = curve_rand_sum,
+    aes(x = t, ymin = lo, ymax = hi),
+    alpha = 0.2
+  ) +
+  {
+    if (isTRUE(params$run_within_bin) && !is.null(curve_rand_bin_sum)) {
+      list(
+        geom_ribbon(
+          data = curve_rand_bin_sum,
+          aes(x = t, ymin = lo, ymax = hi),
+          alpha = 0.2
+        ),
+        geom_line(
+          data = curve_rand_bin_sum,
+          aes(x = t, y = avg_mean_fear, color = policy, linetype = policy),
+          linewidth = 1
+        )
+      )
+    }
+  } +
+  geom_line(
+    data = curve_rand_sum,
+    aes(x = t, y = avg_mean_fear, color = policy, linetype = policy),
+    linewidth = 1
+  ) +
+  geom_line(
+    data = line_df,
+    aes(x = t, y = mean_fear, color = policy, linetype = policy),
+    linewidth = 1
+  ) +
+  labs(
+    x = "Extinction trial (selected stimulus)",
+    y = "Mean fear (simulated)",
+    title = "Extinction simulation with similarity-based generalization",
+    subtitle = paste0(
+      "T=", params$T, ", eta=", params$eta,
+      ", kernel=", params$kernel,
+      ", sigma=", round(sigma, 3),
+      " (", round(sigma_scale_used, 2), "× median distance)"
+    ),
+    color = NULL,
+    linetype = NULL
+  ) +
+  theme_minimal()
+
+p
+```
+
+```{r}
+# ---- Simple summary metrics ----
+auc_vec <- function(y) sum((y[-1] + y[-length(y)]) / 2)
+
+t50_vec <- function(t, y) {
+  thr <- 0.5 * y[t == 0][1]
+  hit <- which(y <= thr)
+  if (length(hit) == 0) NA_integer_ else t[min(hit)]
+}
+
+metric_row <- function(curve, label) {
+  tibble(
+    policy = label,
+    auc = auc_vec(curve$mean_fear),
+    t50 = t50_vec(curve$t, curve$mean_fear),
+    final_mean_fear = curve$mean_fear[curve$t == params$T]
+  )
+}
+
+metrics_sim <- metric_row(curve_sim, "Similarity-aware")
+
+metrics_sim_con <- if (!is.null(curve_sim_con)) metric_row(curve_sim_con, "Similarity-aware (constrained)") else NULL
+metrics_sim_bin <- if (!is.null(curve_sim_bin)) metric_row(curve_sim_bin, "Similarity-aware (within-bin)") else NULL
+
+# Random (unconstrained) summary
+metrics_rand_runs <- curves_rand %>%
+  group_by(run) %>%
+  summarise(
+    auc = auc_vec(mean_fear),
+    t50 = t50_vec(t, mean_fear),
+    final_mean_fear = mean_fear[t == params$T][1],
+    .groups = "drop"
+  )
+
+metrics_rand <- metrics_rand_runs %>%
+  summarise(
+    policy = "Random",
+    avg_auc = mean(auc),
+    auc_lo = quantile(auc, 0.25),
+    auc_hi = quantile(auc, 0.75),
+    avg_t50 = median(t50, na.rm = TRUE),
+    t50_lo = quantile(t50, 0.25, na.rm = TRUE),
+    t50_hi = quantile(t50, 0.75, na.rm = TRUE),
+    avg_final_mean_fear = mean(final_mean_fear),
+    final_lo = quantile(final_mean_fear, 0.25),
+    final_hi = quantile(final_mean_fear, 0.75),
+    .groups = "drop"
+  )
+
+# Random within-bin summary
+metrics_rand_bin <- NULL
+if (!is.null(curves_rand_bin)) {
+  metrics_rand_bin_runs <- curves_rand_bin %>%
+    group_by(run) %>%
+    summarise(
+      auc = auc_vec(mean_fear),
+      t50 = t50_vec(t, mean_fear),
+      final_mean_fear = mean_fear[t == params$T][1],
+      .groups = "drop"
+    )
+
+  metrics_rand_bin <- metrics_rand_bin_runs %>%
+    summarise(
+      policy = "Random (within-bin)",
+      avg_auc = mean(auc),
+      auc_lo = quantile(auc, 0.25),
+      auc_hi = quantile(auc, 0.75),
+      avg_t50 = median(t50, na.rm = TRUE),
+      t50_lo = quantile(t50, 0.25, na.rm = TRUE),
+      t50_hi = quantile(t50, 0.75, na.rm = TRUE),
+      avg_final_mean_fear = mean(final_mean_fear),
+      final_lo = quantile(final_mean_fear, 0.25),
+      final_hi = quantile(final_mean_fear, 0.75),
+      .groups = "drop"
+    )
+}
+
+# Hierarchy metrics (fixed order)
+metrics_hier <- NULL
+if (!is.null(curve_hier) && nrow(curve_hier) > 0) {
+  metrics_hier <- curve_hier %>%
+    group_by(policy) %>%
+    summarise(
+      auc = auc_vec(mean_fear),
+      t50 = t50_vec(t, mean_fear),
+      final_mean_fear = mean_fear[t == params$T][1],
+      .groups = "drop"
+    )
+}
+
+improvement_vs_random <- tibble(
+  metric = c("AUC (percent)", "Final mean fear (percent)", "T50 (trials)"),
+  value = c(
+    100 * (metrics_rand$avg_auc - metrics_sim$auc) / metrics_rand$avg_auc,
+    100 * (metrics_rand$avg_final_mean_fear - metrics_sim$final_mean_fear) / metrics_rand$avg_final_mean_fear,
+    metrics_rand$avg_t50 - metrics_sim$t50
+  )
+)
+
+improvement_within_bin <- {
+  if (!is.null(metrics_sim_bin) && !is.null(metrics_rand_bin)) {
+    tibble(
+      metric = c("AUC (percent)", "Final mean fear (percent)", "T50 (trials)"),
+      value = c(
+        100 * (metrics_rand_bin$avg_auc - metrics_sim_bin$auc) / metrics_rand_bin$avg_auc,
+        100 * (metrics_rand_bin$avg_final_mean_fear - metrics_sim_bin$final_mean_fear) / metrics_rand_bin$avg_final_mean_fear,
+        metrics_rand_bin$avg_t50 - metrics_sim_bin$t50
+      )
+    )
+  } else {
+    tibble(metric = character(0), value = numeric(0))
+  }
+}
+
+list(
+  params = list(
+    T = params$T,
+    eta = params$eta,
+    kernel = params$kernel,
+    sigma = sigma,
+    sigma_scale_used = sigma_scale_used,
+    sigma_r2_loo = sigma_r2,
+    n_bins = params$n_bins,
+    n_bins_actual = n_bins_actual,
+    bin_schedule = params$bin_schedule
+  ),
+  similarity_aware = metrics_sim,
+  similarity_constrained = metrics_sim_con,
+  similarity_within_bin = metrics_sim_bin,
+  random_summary = metrics_rand,
+  random_within_bin_summary = metrics_rand_bin,
+  hierarchy = metrics_hier,
+  improvement_vs_random = improvement_vs_random,
+  improvement_within_bin = improvement_within_bin
+)
+```
+
+```{r}
+# ---- Optional: visualize which stimuli were selected on the MDS map ----
+# Build a long table of selected items for each policy we want to display.
+sel_df <- tibble(
+  id = dat$id,
+  x = dat[[params$x_cols[1]]],
+  y = dat[[params$x_cols[2]]]
+)
+
+sel_points <- bind_rows(
+  tibble(
+    id = dat$id[sim_sim$chosen],
+    chosen_order = seq_along(sim_sim$chosen),
+    policy = "Similarity-aware"
+  ),
+  {
+    if (!is.null(sim_sim_bin) && !is.null(sim_sim_bin$chosen)) {
+      tibble(
+        id = dat$id[sim_sim_bin$chosen],
+        chosen_order = seq_along(sim_sim_bin$chosen),
+        policy = "Similarity-aware (within-bin)"
+      )
+    } else {
+      tibble(id = character(0), chosen_order = integer(0), policy = character(0))
+    }
+  },
+
+  {
+    if (!is.null(sim_sim_con) && !is.null(sim_sim_con$chosen)) {
+      tibble(
+        id = dat$id[sim_sim_con$chosen],
+        chosen_order = seq_along(sim_sim_con$chosen),
+        policy = "Similarity-aware (constrained)"
+      )
+    } else {
+      tibble(id = character(0), chosen_order = integer(0), policy = character(0))
+    }
+  },
+
+  {
+    if (!is.null(hier_sims) && "ascending" %in% names(hier_sims) && !is.null(hier_sims[["ascending"]])) {
+      tibble(
+        id = dat$id[hier_sims[["ascending"]]$chosen],
+        chosen_order = seq_along(hier_sims[["ascending"]]$chosen),
+        policy = "Fear-only (ascending)"
+      )
+    } else {
+      tibble(id = character(0), chosen_order = integer(0), policy = character(0))
+    }
+  },
+  {
+    if (!is.null(hier_sims) && "descending" %in% names(hier_sims) && !is.null(hier_sims[["descending"]])) {
+      tibble(
+        id = dat$id[hier_sims[["descending"]]$chosen],
+        chosen_order = seq_along(hier_sims[["descending"]]$chosen),
+        policy = "Fear-only (descending)"
+      )
+    } else {
+      tibble(id = character(0), chosen_order = integer(0), policy = character(0))
+    }
+  }
+) %>%
+  left_join(sel_df, by = "id") %>%
+  filter(!is.na(x) & !is.na(y))
+
+ggplot(sel_df, aes(x = x, y = y)) +
+  geom_point(alpha = 0.5) +
+  geom_point(
+    data = sel_points,
+    aes(color = policy),
+    size = 2
+  ) +
+  geom_text(
+    data = sel_points,
+    aes(label = chosen_order, color = policy),
+    nudge_y = 0.03,
+    size = 3,
+    show.legend = FALSE
+  ) +
+  labs(
+    title = "Selected stimuli across policies (order annotated)",
+    x = params$x_cols[1], y = params$x_cols[2],
+    color = NULL
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+# ---- Compare within-bin selections on MDS map ----
+
+# Extract one random-within-bin run (e.g., run == 1)
+rand_run1 <- curves_rand_bin %>%
+  dplyr::filter(run == 1)
+
+# We need the chosen indices for that run.
+# If you did not store them, rerun one random-within-bin schedule:
+sim_rand_bin1 <- simulate_schedule(
+  "random_within_bin", fear0, K, params$T, params$eta,
+  order_asc = order_asc, order_desc = order_desc,
+  bin_id = bin_id, n_bins = n_bins_actual,
+  bin_schedule = params$bin_schedule,
+  seed = params$seed + 1
+)
+
+# Build base MDS dataframe
+mds_df <- tibble(
+  id = dat$id,
+  x = dat[[params$x_cols[1]]],
+  y = dat[[params$x_cols[2]]]
+)
+
+# Collect selections
+sel_points <- bind_rows(
+  tibble(
+    id = dat$id[sim_sim_bin$chosen],
+    order = seq_along(sim_sim_bin$chosen),
+    policy = "Similarity-aware (within-bin)"
+  ),
+  tibble(
+    id = dat$id[sim_rand_bin1$chosen],
+    order = seq_along(sim_rand_bin1$chosen),
+    policy = "Random (within-bin)"
+  )
+) %>%
+  left_join(mds_df, by = "id")
+
+# Plot
+ggplot(mds_df, aes(x = x, y = y)) +
+  geom_point(alpha = 0.4) +
+  geom_point(
+    data = sel_points,
+    aes(color = policy),
+    size = 2
+  ) +
+  geom_text(
+    data = sel_points,
+    aes(label = order, color = policy),
+    nudge_y = 0.03,
+    size = 3,
+    show.legend = FALSE
+  ) +
+  labs(
+    title = "Within-bin selection comparison",
+    x = params$x_cols[1],
+    y = params$x_cols[2],
+    color = NULL
+  ) +
+  theme_minimal()# ---- Compare within-bin selections on MDS map ----
+
+# Extract one random-within-bin run (e.g., run == 1)
+rand_run1 <- curves_rand_bin %>%
+  dplyr::filter(run == 1)
+
+# We need the chosen indices for that run.
+# If you did not store them, rerun one random-within-bin schedule:
+sim_rand_bin1 <- simulate_schedule(
+  "random_within_bin", fear0, K, params$T, params$eta,
+  order_asc = order_asc, order_desc = order_desc,
+  bin_id = bin_id, n_bins = n_bins_actual,
+  bin_schedule = params$bin_schedule,
+  seed = params$seed + 1
+)
+
+# Build base MDS dataframe
+mds_df <- tibble(
+  id = dat$id,
+  x = dat[[params$x_cols[1]]],
+  y = dat[[params$x_cols[2]]]
+)
+
+# Collect selections
+sel_points <- bind_rows(
+  tibble(
+    id = dat$id[sim_sim_bin$chosen],
+    order = seq_along(sim_sim_bin$chosen),
+    policy = "Similarity-aware (within-bin)"
+  ),
+  tibble(
+    id = dat$id[sim_rand_bin1$chosen],
+    order = seq_along(sim_rand_bin1$chosen),
+    policy = "Random (within-bin)"
+  )
+) %>%
+  left_join(mds_df, by = "id")
+
+# Plot
+ggplot(mds_df, aes(x = x, y = y)) +
+  geom_point(alpha = 0.4) +
+  geom_point(
+    data = sel_points,
+    aes(color = policy),
+    size = 2
+  ) +
+  geom_text(
+    data = sel_points,
+    aes(label = order, color = policy),
+    nudge_y = 0.03,
+    size = 3,
+    show.legend = FALSE
+  ) +
+  labs(
+    title = "Within-bin selection comparison",
+    x = params$x_cols[1],
+    y = params$x_cols[2],
+    color = NULL
+  ) +
+  theme_minimal()
+```
+
+
+```{r}
+# ---- Side-by-side (faceted) MDS selection paths: within-bin random vs similarity ----
+
+# Re-run one random-within-bin schedule so we have chosen indices
+sim_rand_bin1 <- simulate_schedule(
+  "random_within_bin", fear0, K, params$T, params$eta,
+  order_asc = order_asc, order_desc = order_desc,
+  bin_id = bin_id, n_bins = n_bins_actual,
+  bin_schedule = params$bin_schedule,
+  seed = params$seed + 1
+)
+
+mds_df <- tibble(
+  idx = seq_len(nrow(dat)),
+  id  = dat$id,
+  x   = dat[[params$x_cols[1]]],
+  y   = dat[[params$x_cols[2]]]
+)
+
+sel_points <- bind_rows(
+  tibble(
+    idx = sim_sim_bin$chosen,
+    order = seq_along(sim_sim_bin$chosen),
+    policy = "Similarity-aware (within-bin)"
+  ),
+  tibble(
+    idx = sim_rand_bin1$chosen,
+    order = seq_along(sim_rand_bin1$chosen),
+    policy = "Random (within-bin)"
+  )
+) %>%
+  left_join(mds_df, by = "idx") %>%
+  arrange(policy, order) %>%
+  group_by(policy) %>%
+  mutate(
+    x_next = dplyr::lead(x),
+    y_next = dplyr::lead(y)
+  ) %>%
+  ungroup()
+
+ggplot() +
+  geom_point(data = mds_df, aes(x = x, y = y), alpha = 0.35) +
+  geom_segment(
+    data = dplyr::filter(sel_points, !is.na(x_next) & !is.na(y_next)),
+    aes(x = x, y = y, xend = x_next, yend = y_next),
+    linewidth = 0.6,
+    alpha = 0.8
+  ) +
+  geom_point(
+    data = sel_points,
+    aes(x = x, y = y),
+    size = 2
+  ) +
+  geom_text(
+    data = sel_points,
+    aes(x = x, y = y, label = order),
+    nudge_y = 0.03,
+    size = 3
+  ) +
+  facet_wrap(~policy, nrow = 1) +
+  labs(
+    title = "Within-bin selection paths on MDS map",
+    x = params$x_cols[1],
+    y = params$x_cols[2]
+  ) +
+  theme_minimal()
+
+```

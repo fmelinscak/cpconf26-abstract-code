@@ -1,0 +1,11 @@
+project:
+  type: default
+
+format:
+  html:
+    theme: cosmo
+    toc: true
+
+execute:
+  freeze: auto
+  dir: project
